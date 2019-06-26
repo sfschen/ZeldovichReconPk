@@ -1,6 +1,6 @@
 Slated for public release. XXX = arxiv link.
 
-A code to calculate power spectra in real and redshift space in the Zeldovich approximation. Based on the real-space Zeldovich code
+A code to calculate power spectra in real and redshift space in the Zeldovich approximation, pre- and post-reconstruction. Based on the real-space Zeldovich code
 
  https://github.com/martinjameswhite/CLEFT_GSM/tree/master/HaloZeldovich. 
 
@@ -8,7 +8,12 @@ These codes require SciPy and NumPy, as well as the mcfit library:
 
 https://github.com/eelregit/mcfit
 
-to perform Hankel transforms via FFTLog, which you will need to install.
+to perform Hankel transforms via FFTLog, which you will need to install. To instead compute the equivalent configuration-space numbers see
+
+https://github.com/martinjameswhite/ZeldovichRecon
+
+which we have checked agrees with our results to sub-percent levels except close to zeros of the correlation function.
+
 
 The most general class is "zeldovich_rsd_recon.py" which computes the redshift space pre- and post-reconstruction power spectra for two reconstruction prescriptions, termed "Rec-Sym" and "Rec-Iso" in XXX. Two special cases--the pre-reconstruction redshift space power spectrum and the real-space post-reconstruction spectrum, can be calculated using "zeldovich_rsd.py" and "zeldovich_recon.py", respectively.
 
