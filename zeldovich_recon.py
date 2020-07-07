@@ -1,572 +1,386 @@
-#
-from __future__ import print_function,division
-
 import numpy as np
-from mcfit import SphericalBessel as sph
-#mcfit multiplies by sqrt(2/pi)*x**2 to the function. 
-#Divide the funciton by this to get the correct form 
+from loginterp import loginterp
+import time
 
-from scipy.integrate import quad, simps
-from scipy.interpolate import InterpolatedUnivariateSpline as interpolate
-from scipy.misc import derivative
-import sys
+from scipy.interpolate import interp1d
 
-class Zeldovich:
+from spherical_bessel_transform_fftw import SphericalBesselTransform
+from qfuncfft_recon import QFuncFFT
+
+class Zeldovich_Recon:
     '''
-    Class to evaluate (real space) power spectra in Zeldovich reconstuction..
+    Class to evaluate Zeldovich power spectra post-reconstruction.
     
-    ``Inspired'' by Chirag's code.
+    Based on the soon-to-be-available velocilptors code.
     
     '''
-    def __init__(self, k, p, toler=1e-6):
-        '''k,p are the linear theory power spectra in compatible units,
-        e.g. h/Mpc and (Mpc/h)^3.
-        Note that p contains should contain all the linear theory power spectra for matter, diplaced and shifted fields,
-        s.t. p[0,:] = p_mm, p[1,:] = p_dm, p[2,:] = p_sm; p[3,:] = p_dd; p[4,:] = p_ds; p[5,:] = p_ss,
-        where T stands for \theta_{bc}, normalized at redshifts z = 0
-        '''
-        
-        self.kp    = k
-        self.ps    = p
-        
-        # note: the spectra involving one power of the shift field, are actually for negative this field
-        # this is because the shift field is the MINUS smoothed Zeldovich displacement
-        self.pmm = p[:,0] ; pmax = np.max(self.pmm)
-        self.pdm = p[:,1]
-        self.psm = p[:,2]
-        self.pdd = p[:,3]
-        self.pds = p[:,4]
-        self.pss = p[:,5]
-        
-        
-        self.ilpk_mm    = self.loginterp(k,self.pmm)
-        self.ilpk_dm    = self.loginterp(k[self.pdm>(toler*pmax)],self.pdm[self.pdm>(toler*pmax)])
-        self.ilpk_sm    = self.loginterp(k[self.psm>(toler*pmax)],self.psm[self.psm>(toler*pmax)])
-        self.ilpk_dd    = self.loginterp(k[self.pdd>(toler*pmax)],self.pdd[self.pdd>(toler*pmax)])
-        self.ilpk_ds    = self.loginterp(k[self.pds>(toler*pmax)],self.pds[self.pds>(toler*pmax)])
-        self.ilpk_ss    = self.loginterp(k[self.pss>(toler*pmax)],self.pss[self.pss>(toler*pmax)])
-        
-        self.ilpk = {'mm': self.ilpk_mm, 'dm':self.ilpk_dm, 'sm':self.ilpk_sm, 'dd':self.ilpk_dd, 'ds':self.ilpk_ds, 'ss':self.ilpk_ss}
-        
-        print("here!")
-        self.renorm = np.sqrt(np.pi/2.) #mcfit normaliztion
-        self.tpi2  = 2*np.pi**2.
-        self.kint = np.logspace(-5, 5, 2e4)
-        self.jn    = 10 #number of bessels to sum over
-        
-        self.pktable    = None
-        self.pktable_dd = None
-        self.pktable_ds = None
-        self.pktable_ss = None
-        self.num_power_components = 6 + 4 # four shear terms
-        
-        self.setup()
+
+    def __init__(self, k, p, R = 15., cutoff=20, jn=15, N = 4000, threads=1, extrap_min = -6, extrap_max = 3, shear = True, import_wisdom=False, wisdom_file='./zelda_wisdom.npy'):
     
-        #
-    def setup(self):
-        '''
-        Create X_L, Y_L, xi_L, U1_L \& 0lag sigma.
-        These will all be dictionaries labelled by 'species', except for the X, Y terms,
-        which we'll have to deal with separately...
+        self.shear = shear
         
-        '''
-        self.qv, xi0v = self.xi0lin()
+        self.N = N
+        self.extrap_max = extrap_max
+        self.extrap_min = extrap_min
         
-        pairs = ['mm','dm','sm','dd','ds','ss']
-        self.corlins = {}
-        self.Ulins   = {}
-        self.Xlins   = {}
-        self.Ylins   = {}
+        
+        # set up integration/FFTlog grid
+        self.cutoff = cutoff
+        self.kint = np.logspace(extrap_min,extrap_max,self.N)
+        self.pint = loginterp(k,p)(self.kint) * np.exp(-(self.kint/self.cutoff)**2)
+        self.qint = np.logspace(-extrap_max,-extrap_min,self.N)
+        
+        # self up linear correlation between fields:
+        Sk = np.exp(-0.5 * (R*self.kint)**2)
+        Skm1 = - np.expm1(-0.5 * (R*self.kint)**2)
+        
+        self.plins = {}
+        self.plins['mm'] = self.pint
+        self.plins['dd'] = self.pint * Skm1**2
+        self.plins['ds'] = -self.pint * Skm1 * Sk
+        self.plins['ss'] = self.pint * Sk**2
+        self.plins['dm'] = self.pint * Skm1
+        self.plins['sm'] = -self.pint * Sk
+        
+        # ... and calculate Lagrangian correlators
+        self.setup_2pts()
+        
+        # setup hankel transforms for power spectra
+        if self.shear:
+            self.num_power_components = 10
+            self.num_power_components_ds = 4
+        else:
+            self.num_power_componens = 6
+            self.num_power_components_ds = 3
+            
+            
+        self.jn = jn
+        self.threads = threads
+        self.import_wisdom = import_wisdom
+        self.wisdom_file = wisdom_file
+        self.sph = SphericalBesselTransform(self.qint, L=self.jn, ncol=self.num_power_components, threads=self.threads, import_wisdom= self.import_wisdom, wisdom_file = self.wisdom_file)
+        self.sphx = SphericalBesselTransform(self.qint, L=self.jn, ncol=self.num_power_components_ds, threads=self.threads, import_wisdom= self.import_wisdom, wisdom_file = self.wisdom_file)
+        self.sphs = SphericalBesselTransform(self.qint, L=self.jn, ncol=1, threads=self.threads, import_wisdom= self.import_wisdom, wisdom_file = self.wisdom_file)
+        
+        # indices for the cross
+        self.ds_inds = [1,2,4,7]
+        
+        
+    def setup_2pts(self):
+        
+        # define the various power spectra and compute xi_l_n
+        
+        species = ['s','d','m']
+        self.qfs = {}
+        
+        # matter
+        self.qfs['mm'] = QFuncFFT(self.kint, self.plins['mm'], pair_type='matter',\
+                                                    qv=self.qint,  shear=self.shear)
+        # dd, ds, ss
+        self.qfs['dd'] = QFuncFFT(self.kint, self.plins['dd'], pair_type='disp x disp',\
+                                                    qv=self.qint,  shear=self.shear)
+        self.qfs['ds'] = QFuncFFT(self.kint, self.plins['ds'], pair_type='disp x disp',\
+                                                    qv=self.qint,  shear=self.shear)
+        self.qfs['ss'] = QFuncFFT(self.kint, self.plins['ss'], pair_type='disp x disp',\
+                                                    qv=self.qint,  shear=self.shear)
+            
+        # dm, sm
+        self.qfs['dm'] = QFuncFFT(self.kint, self.plins['dm'], pair_type='disp x bias',\
+                                                    qv=self.qint,  shear=self.shear)
+        self.qfs['sm'] = QFuncFFT(self.kint, self.plins['sm'], pair_type='disp x bias',\
+                                                    qv=self.qint,  shear=self.shear)
+
+        # Now piece together the various X, Y, U, ...
+        # First for the pure displacements
+        pairs = ['mm','dd','ds','ss']
+        
+        self.Xlins = {}
+        self.Ylins = {}
         self.XYlins = {}
-        self.sigmas = {}
         self.yqs = {}
+        self.sigmas = {}
         
         for pair in pairs:
-            
-            # the sign of the spectra of the shift field are hereby fixed....
-            if pair == 'sm' or pair == 'ds':
-                s = -1
-            else:
-                s = +1
-            
-            q_p = -0.5
-            
-            print('Calculating 2-pt functions for species pair ' + pair,'tilt = ' + str(q_p))
-            xi0lag = self.xi0lin0(species=pair)
-            xi0v   = s*self.xi0lin(species=pair,tilt=-q_p)[1] # used to be 1 + q_p which was bad
-            xi2v   = s*self.xi2lin(species=pair,tilt=-q_p)[1]
-
-            self.Xlins[pair] = 2/3.*(xi0lag - xi0v - xi2v)
-
-            
-            # Check Ylin for zeros
-            ylinv = 2*xi2v
-            mask = (ylinv == 0)
-            ylinv[mask] = interpolate(self.qv[~mask], ylinv[~mask])(self.qv[mask])
-            self.Ylins[pair] = ylinv
-            self.yqs[pair] = (1*self.Ylins[pair]/self.qv)
+            a, b = pair[0], pair[1]
+            self.Xlins[pair] = 2./3 * ( 0.5*self.qfs[a+a].xi0m2[0] + 0.5*self.qfs[b+b].xi0m2[0] \
+                                            - self.qfs[pair].xi0m2 - self.qfs[pair].xi2m2 )
+            self.Ylins[pair] = 2 * self.qfs[pair].xi2m2
             
             self.XYlins[pair] = self.Xlins[pair] + self.Ylins[pair]
-            self.sigmas[pair] = self.XYlins[pair][-1]
-        
-            self.corlins[pair] = s*self.corr(species=pair,tilt=1.5)[1] # used to be 3 + q_p
-            self.Ulins[pair]   = s*self.u10lin(species=pair,tilt=1.5)[1] # used to be 2 + qp
-        
-
-        self.XYlin_mm = self.Xlins['mm'] + self.Ylins['mm']; self.sigma_mm = self.XYlin_mm[-1]
-        self.XYlin_dd = self.Xlins['dd'] + self.Ylins['dd']; self.sigma_dd = self.XYlin_dd[-1]
-        self.XYlin_ds = self.Xlins['ds'] + self.Ylins['ds']; self.sigma_ds = self.XYlin_ds[-1]
-        self.XYlin_ss = self.Xlins['ss'] + self.Ylins['ss']; self.sigma_ss = self.XYlin_ss[-1]
-
-        # calculate shear correlators
-        self.zetas = {}
-        self.chis  = {}
-        self.Xs2s  = {}
-        self.Ys2s  = {}
-        self.Vs    = {}
+            self.sigmas[pair] = self.Xlins[pair][-1]
+            self.yqs[pair] = (1*self.Ylins[pair]/self.qint)
             
-        xi2lin_mm = self.xi2lin(species='mm',k_power=2)[1]
             
-        for pair in ['mm','dm','sm']:
-            if pair != 'mm':
-                tilt = 0
-            else:
-                tilt = 1.5
+        # Now for the bias x displacmment terms
+        pairs = ['mm', 'dm', 'sm']
+    
+        self.Ulins = {}
+        self.Vs = {} # dm, sm
+        self.Xs2s = {} # dm, sm
+        self.Ys2s = {} # dm, sm
+        
+        for pair in pairs:
+            a, b = pair[0], pair[1]
+            self.Ulins[pair] = - self.qfs[pair].xi1m1
             
-            if pair == 'sm' or pair == 'ds':
-                s = -1
-            else:
-                s = +1
+            if self.shear:
+                J2 = 2.*self.qfs[pair].xi1m1/15 - 0.2*self.qfs[pair].xi3m1
+                J3 = -0.2*self.qfs[pair].xi1m1 - 0.2*self.qfs[pair].xi3m1
+                J4 = self.qfs[pair].xi3m1
                 
-            xi0lin = s*self.xi0lin(species=pair,k_power=2,tilt=1.5)[1]
-            xi2lin = s*self.xi2lin(species=pair,k_power=2,tilt=0.5)[1]
-            xi4lin = s*self.xi4lin(species=pair,k_power=2,tilt=0.5)[1]
+                self.Vs[pair] = 4 * J2 * self.qfs['mm'].xi20
+                self.Xs2s[pair] = 4 * J3**2
+                self.Ys2s[pair] = 6*J2**2 + 8*J2*J3 + 4*J2*J4 + 4*J3**2 + 8*J3*J4 + 2*J4**2
                 
-            xi1lin = s*self.xi1lin(species=pair,k_power=1,tilt=0.5)[1]
-            xi3lin = s*self.xi3lin(species=pair,k_power=1,tilt=0.5)[1]
+        # ... and finally the pure bias terms, i.e. matter
+        self.corlins = {'mm':self.qfs['mm'].xi00}
+        if self.shear:
+            self.zetas = {'mm': 2*(4*self.qfs['mm'].xi00**2/45. + 8*self.qfs['mm'].xi20**2/63. + 8*self.qfs['mm'].xi40**2/35)}
+            self.chis = {'mm':4*self.qfs['mm'].xi20**2/3.}
                 
-            J2 = 2.*xi1lin/15 - 0.2*xi3lin
-            J3 = -0.2*xi1lin - 0.2*xi3lin
-            J4 = xi3lin
-
-            self.zetas[pair] = 2*(4*xi0lin**2/45. + 8*xi2lin**2/63. + 8*xi4lin**2/35)
-            self.chis[pair]  = 4*xi2lin**2/3.
-            self.Vs[pair] = 4 * J2 * xi2lin_mm
-            self.Xs2s[pair] = 4 * J3**2
-            self.Ys2s[pair] = 6*J2**2 + 8*J2*J3 + 4*J2*J4 + 4*J3**2 + 8*J3*J4 + 2*J4**2
-
-
-    ### Interpolate functions in log-sapce beyond the limits
-    def loginterp(self, x, y, yint = None, side = "both",\
-                  lorder = 15, rorder = 15, lp = 1, rp = -1, \
-                  ldx = 1e-6, rdx = 1e-6):
+                
+                
+                
+    def p_integrals(self, k):
         '''
-        Extrapolate function by evaluating a log-index of left & right side
+        Only a small subset of terms included for now for testing.
         '''
-        if yint is None:
-            yint = interpolate(x, y, k = 5)
-        if side == "both":
-            side = "lr"
-            l =lp
-            r =rp
-        lneff = derivative(yint, x[l], dx = x[l]*ldx, order = lorder)*x[l]/y[l]
-        rneff = derivative(yint, x[r], dx = x[r]*rdx, order = rorder)*x[r]/y[r]
-        print('Log index on left & right edges are = ', lneff, rneff)
-        #
-        xl = np.logspace(-18, np.log10(x[l]), 10**6.)
-        xr = np.logspace(np.log10(x[r]), 10., 10**6.)
-        yl = y[l]*(xl/x[l])**lneff
-        yr = y[r]*(xr/x[r])**rneff
-        #
-        xint = x[l+1:r].copy()
-        yint = y[l+1:r].copy()
-        if side.find("l") > -1:
-            xint = np.concatenate((xl, xint))
-            yint = np.concatenate((yl, yint))
-        if side.find("r") > -1:
-            xint = np.concatenate((xint, xr))
-            yint = np.concatenate((yint, yr))
-        yint2 = interpolate(xint, yint, k = 5)
-        #
-        return yint2
-
-    def dosph(self, n, x, f, tilt = 1.5, extrap = True):
-        #Function to do bessel integral using FFTLog for kernels
-        f = f*self.renorm
-        return sph(x, nu = n, q = tilt)(f, extrap = extrap)
-    
-    #PT kernels below
-    
-    #0 lag
-    def xi0lin0(self, species='mm', kmin = 1e-6, kmax = 1e3, k_power=0):
-        # Note: the 0 lag piece here is the ONLY place the arithmetic mean instead
-        #       of the geometric mean is used to evaluate a cross term.
-        #       the k_power option allows you to calculate derivatives for higher derivatives of Psi
+        ksq = k**2; kcu = k**3
         
-        X = species[0]; Y = species[1]
-        integrand = lambda k: 0.5*(self.ilpk[X+X](k)+self.ilpk[Y+Y](k))
+        expon = np.exp(-0.5*ksq * (self.XYlin - self.sigma))
+        exponm1 = np.expm1(-0.5*ksq * (self.XYlin - self.sigma))
+        suppress = np.exp(-0.5*ksq *self.sigma)
         
-        val = simps(integrand(self.kp) * (self.kp>kmin) * (self.kp<kmax), self.kp ) / self.tpi2
-
-        return val
-    #j0
-    def xi0lin(self, species='mm', kint = None, tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(0, kint, integrand, tilt = tilt)
-    def xi1lin(self, species='mm', kint = None, tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(1, kint, integrand, tilt = tilt)
-    #j2
-    def xi2lin(self, species='mm', kint = None, tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(2, kint, integrand, tilt = tilt)
-    def xi3lin(self, species='mm', kint = None, tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(3, kint, integrand, tilt = tilt)
-    def xi4lin(self, species='mm', kint = None, tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(4, kint, integrand, tilt = tilt)
-    
-    #u1
-    def u10lin(self, species='mm', kint = None,  tilt = 0,k_power=0):
-        if kint is None:
-            kint = self.kint
-        integrand = -1*kint*self.ilpk[species](kint) * kint**k_power
-        integrand /= (kint**2.*self.tpi2)
-        return self.dosph(1, kint, integrand, tilt = tilt)
-
-    #correlation function
-    def corr(self, species='mm', kint = None, tilt = 0):
-        if kint is None:
-            kint = self.kint
-        integrand = self.ilpk[species](kint)
-        integrand /= (1.*self.tpi2)
-        return self.dosph(0, kint, integrand, tilt = tilt)
-
-    #################
-    #Bessel Integrals for \mu
-    def template(self, k, l, func, expon, suppress, power=1, za = False, expon_za = 1.,tilt=None, species='mm'):
-        '''
-        Generic template that is followed by mu integrals
-        j0 is different since its exponent has sigma subtracted that is
-        later used to suppress integral
-        '''
+        ret = np.zeros(self.num_power_components)
         
-        Fq = np.zeros_like(self.qv)
+        bias_integrands = np.zeros( (self.num_power_components,self.N)  )
         
-        if za == True and l == 0:
-            Fq = expon_za * func * (self.yq)**l
+        if self.shear:
+            zero_lags = np.array([1,0,0,0,0,0,-ksq*self.sigmas2,0,0,0])
         else:
-            Fq = expon * func * (self.yq)**l
+            zero_lags = np.array([1,0,0,0,0,0])
         
-        if tilt is not None:
-            q = max(0,tilt-l)
-        else:
-            q = max(0,1.5-l)
-        
-        # note that the angular integral for even powers of mu gives J_(l+1)
-        ktemp, ftemp = sph(self.qv, nu= l+(power%2), q=q)(Fq*self.renorm,extrap = False)
-        ftemp *= suppress
+        for l in range(self.jn):
+            # l-dep functions
+            shiftfac = (l>0)/(k * self.yq)
+            mu2fac = 1. - 2.*l/ksq/self.Ylin
+            mu3fac = 1. - 2.*(l-1)/ksq/self.Ylin # mu3 terms start at j1 so l -> l-1
+            
+            bias_integrands[0,:] = 1. # za
+            bias_integrands[1,:] = -2 * k * self.Ulin * shiftfac  # b1
+            bias_integrands[2,:] = self.corlin - ksq*mu2fac*self.Ulin**2# b1sq
+            bias_integrands[3,:] = - ksq * mu2fac * self.Ulin**2 # b2
+            bias_integrands[4,:] = (-2 * k * self.Ulin * self.corlin) * shiftfac # b1b2
+            bias_integrands[5,:] = 0.5 * self.corlin**2 # b2sq
+            
+            if self.shear:
+                bias_integrands[6,:] = -ksq * (self.Xs2 + mu2fac*self.Ys2)# bs
+                bias_integrands[7,:] = -2*k*self.V*shiftfac # b1bs
+                bias_integrands[8,:] = self.chi # b2bs
+                bias_integrands[9,:] = self.zeta # bssq
 
-        return 1* k**l * np.interp(k, ktemp, ftemp)
 
-    def setup_yq(self, D= 1, species='mm'):
-        '''
-            Use the right species in the Bessel expansion for Y(q)
-            '''
-        self.yq = self.Ylins[species] * D**2 / self.qv
+            # multiply by IR exponent
+            if l == 0:
+                bias_integrands = bias_integrands * expon
+                bias_integrands -= zero_lags[:,None] # note that expon(q = infinity) = 1
+            else:
+                bias_integrands = bias_integrands * expon * self.yq**l
+            
+            # do FFTLog
+            ktemps, bias_ffts = self.sph.sph(l, bias_integrands)
+            ret +=  k**l * interp1d(ktemps, bias_ffts)(k)
     
     
-    
+        #ret += ret[0] * zero_lags
         
-    def p_integrals(self, k, D = 1,jn=None):
+        return 4*suppress*np.pi*ret
+
+    def make_ptable(self, kmin = 1e-3, kmax = 3, nk = 100):
         '''
-            Power spectra contributions for a single k.
-            '''
-        
+        Make a table of different terms of P(k) between a given
+        'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
+        This is the most time consuming part of the code.
+        '''
         pair = 'mm'
+        self.Xlin = self.Xlins[pair]
+        self.Ylin = self.Ylins[pair]
+        self.sigma = self.sigmas[pair]
+        self.yq = self.yqs[pair]
+        self.XYlin = self.XYlins[pair]
         
-        if jn == None:
-            jn = self.jn
+        self.Ulin = self.Ulins[pair]
+        self.corlin = self.corlins[pair]
         
-        ksq = k**2
-        
-        D2 = D**2; D4 = D2**2
-        
-        expon = np.exp(-0.5*ksq * D2 * (self.XYlin_mm - self.sigma_mm))
-        exponm1 = np.expm1(-0.5*ksq * D2 *  (self.XYlin_mm - self.sigma_mm))
-        suppress = np.exp(-0.5*ksq * D2 * self.sigma_mm)
-        
-        Ylin = self.Ylins['mm'] * D2
-        
-        Ulin = self.Ulins['mm'] * D2
-        corlin = self.corlins['mm'] * D2
-        V = self.Vs['mm'] * D4
-        chi = self.chis['mm'] * D4
-        zeta = self.zetas['mm'] * D4
-        Xs2 = self.Xs2s['mm'] * D4
-        Ys2 = self.Ys2s['mm'] * D4
-        
-        za, b1, b1sq, b2, b2sq, b1b2, bs, b1bs, b2bs, bssq = (0,)*self.num_power_components
-        
-        #l indep functions
-        fza = 1.
-        fb1 = -2 * k * Ulin
-        fb1b2 = -2 * k * Ulin * corlin
-        fb2sq = 0.5 * corlin**2
-        fb1bs = - 2 * k * V
-        fb2bs = chi
-        fbssq  = zeta
-        
-        for l in range(jn):
-            mu2fac = 1. - 2.*l/ksq/Ylin
-            fb1sq = corlin - ksq * mu2fac * Ulin**2
-            fb2 = - ksq * mu2fac * Ulin**2
-            fbs = - ksq * (Xs2 + mu2fac * Ys2)
+        if self.shear:
+            self.V = self.Vs[pair]
+            self.Xs2 = self.Xs2s[pair]; self.sigmas2 = self.Xs2[-1]
+            self.Ys2 = self.Ys2s[pair]
+            self.chi = self.chis[pair]
+            self.zeta = self.zetas[pair]
             
-            #do integrals
-            za += self.template(k,l,fza,expon,suppress,power=0,za=True,expon_za=exponm1,species=pair )
-            b1 += self.template(k,l,fb1,expon,suppress,power=1,species=pair )
-            b1sq += self.template(k,l,fb1sq,expon,suppress,power=0,species=pair )
-            b2 += self.template(k,l,fb2,expon,suppress,power=0,species=pair )
-            b2sq += self.template(k,l,fb2sq,expon,suppress,power=0,species=pair )
-            b1b2 += self.template(k,l,fb1b2,expon,suppress,power=1,species=pair )
-        
-            bs += self.template(k,l,fbs,expon,suppress,power=0,species=pair )
-            b1bs += self.template(k,l,fb1bs,expon,suppress,power=1,species=pair)
-            b2bs += self.template(k,l,fb2bs,expon,suppress,power=0,species=pair )
-            bssq += self.template(k,l,fbssq,expon,suppress,power=0,species=pair )
-        
-        return 4*np.pi*np.array([za,b1,b1sq,b2,b2sq,b1b2,bs,b1bs,b2bs,bssq])
-
-
-    def make_ptable(self, D = 1, kmin = 1e-3, kmax = 2, nk = 200, jlfunc=None):
-        '''Make a table of different terms of P(k) between a given
-            'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
-            This is the most time consuming part of the code.
-            '''
-        if jlfunc is None:
-            jlfunc = lambda k: self.jn
-        
-        self.setup_yq(D=D,species='mm')
         
         self.pktable = np.zeros([nk, self.num_power_components+1]) # one column for ks
         kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
         self.pktable[:, 0] = kv[:]
-        print("Hankel transforms now off to the presses!")
         for foo in range(nk):
-            print(foo)
-            self.pktable[foo, 1:] = self.p_integrals(kv[foo],jn=jlfunc(kv[foo]),D=D)
-
-        return self.pktable
-
-        
-    
-    def pdd_integrals(self, k, D = 1, jn=None):
-        '''Same as p_integrals but for the dd autospectrum.
-            '''
-        
-        if jn == None:
-            jn = self.jn
-        
-        pair = 'dd'
-        
-        D2 = D**2; D4 = D2**2
-        
-        ksq = k**2
-        expon = np.exp(-0.5*ksq * D2 * (self.XYlin_dd - self.sigma_dd))
-        exponm1 = np.expm1(-0.5*ksq * D2 * (self.XYlin_dd - self.sigma_dd))
-        suppress = np.exp(-0.5*ksq*D2*self.sigma_dd)
-        
-        Ylin = self.Ylins['dd'] * D2
-        
-        Ulin = self.Ulins['dm'] * D2
-        corlin = self.corlins['mm'] * D2
-        V = self.Vs['dm'] * D4
-        chi = self.chis['mm'] * D4
-        zeta = self.zetas['mm'] * D4
-        Xs2 = self.Xs2s['dm'] * D4
-        Ys2 = self.Ys2s['dm'] * D4
-        
-
-        za, b1, b1sq, b2, b2sq, b1b2, bs, b1bs, b2bs, bssq = (0,)*self.num_power_components
-        
-        #l indep functions
-        fza = 1.
-        fb1 = -2 * k * Ulin
-        fb1b2 = -2 * k * Ulin * corlin
-        fb2sq = 0.5 * corlin**2
-        fb1bs = - 2 * k * V
-        fb2bs = chi
-        fbssq  = zeta
-        
-        for l in range(jn):
-            mu2fac = 1. - 2.*l/ksq/Ylin
-            fb1sq = corlin - ksq * mu2fac * Ulin**2
-            fb2 = - ksq * mu2fac * Ulin**2
-            fbs = - ksq * (Xs2 + mu2fac * Ys2)
-
-            #do integrals
-            za += self.template(k,l,fza,expon,suppress,power=0,za=True,expon_za=exponm1,species=pair)
-            b1 += self.template(k,l,fb1,expon,suppress,power=1,species=pair)
-            b1sq += self.template(k,l,fb1sq,expon,suppress,power=0,species=pair)
-            b2 += self.template(k,l,fb2,expon,suppress,power=0,species=pair)
-            b2sq += self.template(k,l,fb2sq,expon,suppress,power=0,species=pair)
-            b1b2 += self.template(k,l,fb1b2,expon,suppress,power=1,species=pair)
-        
-            bs += self.template(k,l,fbs,expon,suppress,power=0,species=pair)
-            b1bs += self.template(k,l,fb1bs,expon,suppress,power=1,species=pair)
-            b2bs += self.template(k,l,fb2bs,expon,suppress,power=0,species=pair)
-            bssq += self.template(k,l,fbssq,expon,suppress,power=0,species=pair)
-        
-        return 4*np.pi*np.array([za,b1,b1sq,b2,b2sq,b1b2,bs,b1bs,b2bs,bssq])
-    
-
-    def make_pddtable(self, D = 1, kmin = 1e-3, kmax = 2, nk = 200, jlfunc=None):
-        '''Make a table of different terms of P(k) between a given
+            self.pktable[foo, 1:] = self.p_integrals(kv[foo])
+            
+            
+    def make_pddtable(self, kmin = 1e-3, kmax = 3, nk = 100):
+        '''
+        Make a table of different terms of P(k) between a given
         'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
         This is the most time consuming part of the code.
         '''
+        pair = 'dd'
+        self.Xlin = self.Xlins[pair]
+        self.Ylin = self.Ylins[pair]
+        self.sigma = self.sigmas[pair]
+        self.yq = self.yqs[pair]
+        self.XYlin = self.XYlins[pair]
         
-        if jlfunc is None:
-            jlfunc = lambda k: self.jn
+        self.Ulin = self.Ulins['dm']
+        self.corlin = self.corlins['mm']
         
-        self.setup_yq(species='dd',D=D)
+        if self.shear:
+            self.V = self.Vs['dm']
+            self.Xs2 = self.Xs2s['dm']; self.sigmas2 = self.Xs2[-1]
+            self.Ys2 = self.Ys2s['dm']
+            self.chi = self.chis['mm']
+            self.zeta = self.zetas['mm']
+            
         
         self.pktable_dd = np.zeros([nk, self.num_power_components+1]) # one column for ks
         kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
         self.pktable_dd[:, 0] = kv[:]
-        print("Hankel transforms now off to the presses!")
         for foo in range(nk):
-            print(foo)
-            self.pktable_dd[foo, 1:] = self.pdd_integrals(kv[foo],jn=jlfunc(kv[foo]),D=D)
-
-        return self.pktable_dd
-
-    def pds_integrals(self, k, D = 1, jn = None):
-        '''Same but for the ds cross spectrum. Roughly half as many terms.
+            self.pktable_dd[foo, 1:] = self.p_integrals(kv[foo])
             
-            '''
-        if jn == None:
-            jn = self.jn
         
-        D2 = D**2; D4 = D2**2
         
+    def pds_integrals(self, k):
+        '''
+        Only a small subset of terms included for now for testing.
+        '''
+        ksq = k**2; kcu = k**3
+        
+        expon = np.exp(-0.5*ksq * (self.XYlin - self.sigma))
+        exponm1 = np.expm1(-0.5*ksq * (self.XYlin - self.sigma))
+        suppress = np.exp(-0.5*ksq *self.sigma)
+        
+        ret = np.zeros(self.num_power_components_ds)
+        
+        bias_integrands = np.zeros( (self.num_power_components_ds,self.N)  )
+        
+        if self.shear:
+            zero_lags = np.array([1,0,0,-ksq*self.sigmas2])
+        else:
+            zero_lags = np.array([1,0,0])
+        
+        for l in range(self.jn):
+            # l-dep functions
+            shiftfac = (l>0)/(k * self.yq)
+            mu2fac = 1. - 2.*l/ksq/self.Ylin
+            mu3fac = 1. - 2.*(l-1)/ksq/self.Ylin # mu3 terms start at j1 so l -> l-1
+            
+            bias_integrands[0,:] = 1. # za
+            bias_integrands[1,:] = - k * self.Ulin * shiftfac  # b1
+            bias_integrands[2,:] = - 0.5 * ksq * mu2fac * self.Ulin**2 # b2
+
+            
+            if self.shear:
+                bias_integrands[3,:] = - 0.5 * ksq * (self.Xs2 + mu2fac*self.Ys2)# bs
+
+            # multiply by IR exponent
+            if l == 0:
+                bias_integrands = bias_integrands * expon
+                bias_integrands -= zero_lags[:,None] # note that expon(q = infinity) = 1
+            else:
+                bias_integrands = bias_integrands * expon * self.yq**l
+            
+            # do FFTLog
+            ktemps, bias_ffts = self.sphx.sph(l, bias_integrands)
+            ret +=  k**l * interp1d(ktemps, bias_ffts)(k)
+    
+        
+        return 4*suppress*np.pi*ret
+
+    def make_pdstable(self, kmin = 1e-3, kmax = 3, nk = 100):
+        '''
+        Make a table of different terms of P(k) between a given
+        'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
+        This is the most time consuming part of the code.
+        '''
         pair = 'ds'
-        ksq = k**2
-        expon = np.exp(-0.5*ksq * D2 * (self.XYlin_ds - self.sigma_ds))
-        exponm1 = np.expm1(-0.5*ksq * D2* (self.XYlin_ds - self.sigma_ds))
-        suppress = np.exp(-0.5*ksq * D2 * self.sigma_ds)
-        Ylin = self.Ylins[pair] * D2
+        self.Xlin = self.Xlins[pair]
+        self.Ylin = self.Ylins[pair]
+        self.sigma = self.sigmas[pair]
+        self.yq = self.yqs[pair]
+        self.XYlin = self.XYlins[pair]
         
-        za, b1, b1sq, b2, b2sq, b1b2, bs, b1bs, b2bs, bssq = (0,)*self.num_power_components
+        self.Ulin = self.Ulins['sm']
         
-        #l indep functions
-        fza = 1.
-        fb1 = -k * self.Ulins['sm'] * D2
-        
-        for l in range(jn):
-            mu2fac = 1. - 2.*l/ksq/self.Ylins[pair]/D2
-            fb2 = - 0.5 * ksq * mu2fac * self.Ulins['sm']**2 * D4
-            fbs = - 0.5 * ksq * (self.Xs2s['sm'] + mu2fac * self.Ys2s['sm']) * D4
-            
-            #do integrals
-            za += self.template(k,l,fza, expon,suppress,power=0,za=True,expon_za=exponm1,species=pair )
-            b1 += self.template(k,l,fb1,expon,suppress,power=1,species=pair )
-            b2 += self.template(k,l,fb2,expon,suppress,power=0,species=pair )
-            bs += self.template(k,l,fbs,expon,suppress,power=0,species=pair )
-        
-        return 4*np.pi*np.array([za,b1,b1sq,b2,b2sq,b1b2,bs,b1bs,b2bs,bssq])
-    
-    
-    def make_pdstable(self, D = 1, kmin = 1e-3, kmax = 2, nk = 200, jlfunc = None):
-        '''Make a table of different terms of P(k) between a given
-            'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
-            This is the most time consuming part of the code.
-            '''
-        
-        if jlfunc == None:
-            jlfunc = lambda k: self.jn
-        
-        self.setup_yq(species='ds',D=D)
-        
+        if self.shear:
+            self.Xs2 = self.Xs2s['sm']; self.sigmas2 = self.Xs2[-1]
+            self.Ys2 = self.Ys2s['sm']
+
         self.pktable_ds = np.zeros([nk, self.num_power_components+1]) # one column for ks
         kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
         self.pktable_ds[:, 0] = kv[:]
-        print("Hankel transforms now off to the presses!")
         for foo in range(nk):
-            print(foo)
-            self.pktable_ds[foo, 1:] = self.pds_integrals(kv[foo],jn=jlfunc(kv[foo]),D=D)
-
-        return self.pktable_ds
-
-
-
-    def pss_integrals(self, k, D = 1, jn = None):
+            self.pktable_ds[foo, self.ds_inds] = self.pds_integrals(kv[foo])
+            
+            
+            
+    def pss_integrals(self, k):
         '''
-            Only one term in the ss autospectrum!
-                        '''
+        Only a small subset of terms included for now for testing.
+        '''
+        ksq = k**2; kcu = k**3
+        
+        expon = np.exp(-0.5*ksq * (self.XYlin - self.sigma))
+        exponm1 = np.expm1(-0.5*ksq * (self.XYlin - self.sigma))
+        suppress = np.exp(-0.5*ksq *self.sigma)
+        
+        ret = 0
+        
+        bias_integrands = np.zeros( (1,self.N)  )
+        zero_lags = 1
+
+        
+        for l in range(self.jn):
+            bias_integrands[0,:] = 1. # za
+
+            # multiply by IR exponent
+            if l == 0:
+                bias_integrands = bias_integrands * expon
+                bias_integrands -= zero_lags # note that expon(q = infinity) = 1
+            else:
+                bias_integrands = bias_integrands * expon * self.yq**l
+            
+            # do FFTLog
+            ktemps, bias_ffts = self.sphs.sph(l, bias_integrands)
+            ret +=  k**l * interp1d(ktemps, bias_ffts)(k)
+            
+        return 4*suppress*np.pi*ret
+
+    def make_psstable(self, kmin = 1e-3, kmax = 3, nk = 100):
+        '''
+        Make a table of different terms of P(k) between a given
+        'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
+        This is the most time consuming part of the code.
+        '''
         pair = 'ss'
+        self.Xlin = self.Xlins[pair]
+        self.Ylin = self.Ylins[pair]
+        self.sigma = self.sigmas[pair]
+        self.yq = self.yqs[pair]
+        self.XYlin = self.XYlins[pair]
         
-        if jn == None:
-            jn = self.jn
-        
-        ksq = k**2
-        D2 = D**2
-        
-        expon = np.exp(-0.5*ksq * D2 * (self.XYlin_ss - self.sigma_ss))
-        exponm1 = np.expm1(-0.5*ksq * D2 * (self.XYlin_ss - self.sigma_ss))
-        suppress = np.exp(-0.5*ksq * D2 * self.sigma_ss)
-        
-        Ylin = self.Ylins[pair] * D2
-    
-        za, b1, b1sq, b2, b2sq, b1b2, bs, b1bs, b2bs, bssq = (0,)*self.num_power_components
-        
-        #l indep functions
-        fza = 1.
 
-        for l in range(jn):
-            #do integrals
-            za += self.template(k,l,fza, expon,suppress,power=0,za=True,expon_za=exponm1,species=pair )
-
-        return 4*np.pi*np.array([za,b1,b1sq,b2,b2sq,b1b2,bs, b1bs, b2bs, bssq])
-    
-    
-    def make_psstable(self, D=1,kmin = 1e-3, kmax = 2, nk = 200, jlfunc=None):
-        '''Make a table of different terms of P(k) between a given
-            'kmin', 'kmax' and for 'nk' equally spaced values in log10 of k
-            This is the most time consuming part of the code.
-            '''
-        if jlfunc is None:
-            jlfunc = lambda k: self.jn
-        
-        self.setup_yq(species='ss',D=D)
-        
         self.pktable_ss = np.zeros([nk, self.num_power_components+1]) # one column for ks
         kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
         self.pktable_ss[:, 0] = kv[:]
-        print("Hankel transforms now off to the presses!")
         for foo in range(nk):
-            print(foo)
-            self.pktable_ss[foo, 1:] = self.pss_integrals(kv[foo],jn=jlfunc(kv[foo]),D=D)
-
-        return self.pktable_ss
-
-
-if __name__ == '__main__':
-    print(0)
+            self.pktable_ss[foo, 1] = self.pss_integrals(kv[foo])

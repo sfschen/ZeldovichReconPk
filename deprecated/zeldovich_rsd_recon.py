@@ -765,6 +765,7 @@ class Zeldovich_Recon_RSD:
                 k_obs = k_apfac * k
                 nsum = nmaxfunc(k_obs)
                 if recon and method == 'RecSym':
+                    print("I'm here.")
                     self.setup_rsd_facs(f,nu_obs,pair='dd',D=D)
                     pknutable[ii,jj,:] = self.p_integrals_dd(k_obs,nmax=nsum,jn=jlfunc(k))
                     self.setup_rsd_facs(f,nu_obs,pair='ss',D=D)
