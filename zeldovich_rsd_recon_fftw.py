@@ -584,7 +584,7 @@ class Zeldovich_Recon:
 
     # Compute multipoles directly
 
-    def make_pltable(self,f, D = 1,ngauss = 2, kmin = 1e-3, kmax = 0.5, nk = 30, nmax=8, method = 'Pre-Recon', a_perp = 1, a_par = 1):
+    def make_pltable(self,f, D = 1,ngauss = 2, kv = None, kmin = 1e-3, kmax = 0.5, nk = 30, nmax=8, method = 'Pre-Recon', a_perp = 1, a_par = 1):
         ''' Make a table of the monopole and quadrupole in k space.
             Using gauss legendre integration.
             With a_perp and a_par, this gives the observed (and not ``true'') multipoles.'''
@@ -597,8 +597,13 @@ class Zeldovich_Recon:
         L2 = np.polynomial.legendre.Legendre((0,0,1))(nus)
         L4 = np.polynomial.legendre.Legendre((0,0,0,0,1))(nus)
         
+        if kv is None:
+            kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
+        else:
+            nk = len(kv)
+        
         pknutable = np.zeros((len(nus),nk,self.num_power_components+3))
-        kv = np.logspace(np.log10(kmin), np.log10(kmax), nk)
+        
         
         for ii, nu in enumerate(nus_calc):
             # calculate P(k,nu) at the true coordinates, given by
