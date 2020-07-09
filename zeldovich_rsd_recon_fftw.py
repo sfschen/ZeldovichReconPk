@@ -342,7 +342,7 @@ class Zeldovich_Recon:
             self.pktable = np.zeros([len(ks), self.num_power_components+1])
             kv = np.array(ks)
         
-        self.pktable_dd[:, 0] = kv[:]; N = len(kv)
+        self.pktable[:, 0] = kv[:]; N = len(kv)
         for foo in range(N):
             self.pktable[foo, 1:] = self.p_integrals(kv[foo])
             
